@@ -1,0 +1,78 @@
+sample_rate: 16000
+chunk_ms: 20
+chunk_samples: 320
+
+dataset:
+  speech_path: data/tts_speech_negative_16k.sw
+  segment_seconds: 2.0
+  split: train
+  val_fraction: 0.02
+  split_seed: 1234
+  max_segments: null
+
+dred_cache:
+  cache_dir: cache/dred
+  manifest_path: cache/dred/manifest_train.jsonl
+  val_manifest_path: cache/dred/manifest_val.jsonl
+  opus_root: third_party/opus-jstsp-dred
+  opus_demo_path: third_party/opus-jstsp-dred/opus_demo
+  dred_checkpoint_dir: checkpoints/dred
+  bitrate: 64000
+  dred_frames_10ms: 100
+  dry_run: false
+  num_workers: 3
+
+model:
+  channels: 96
+  latent_dim: 96
+  decoder_hidden: 128
+  scalar_quantizers: 2
+  vector_quantizers: 6
+  codebook_size: 256
+  active_quantizers_train: [2, 4, 8]
+
+packet_loss:
+  random_loss_p: 0.05
+  burst_loss_p: 0.02
+  min_burst: 1
+  max_burst: 5
+
+dred:
+  provider: external
+  command: null
+  context_seconds_min: 0.5
+  context_seconds_max: 2.0
+
+training:
+  # Runtime defaults. CLI flags in scripts/train.py override these values.
+  stage: base
+  device: auto
+  distributed: false
+  progress: true
+  output_dir: null
+  base_output_dir: runs/base_full_2gpu
+  repair_output_dir: runs/repair_full_2gpu
+  resume: null
+  base_resume: null
+  repair_resume: null
+  log_file: null
+  log_every: 10
+  save_every: 5638
+  num_workers: 2
+  max_segments: null
+  max_val_segments: null
+  val_every_epochs: 5
+  val_max_batches: null
+  clearml_enabled: true
+  clearml_project: dred_minienc
+  clearml_task_name: null
+
+  base_lr: 0.0002
+  repair_lr: 0.0002
+  batch_size: 32
+  segment_seconds: 2.0
+  base_epochs: 100
+  repair_epochs: 100
+  base_steps: null
+  repair_steps: null
+  joint_steps: 50000
