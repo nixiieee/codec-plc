@@ -19,7 +19,7 @@ class StateRepairMiniEncoder(nn.Module):
             nn.SiLU(),
             CausalConv1d(channels, channels, 5, stride=2),
             nn.SiLU(),
-            nn.AdaptiveAvgPool1d(1),
+            CausalConv1d(channels, channels, 80, stride=80),
         )
         self.state_proj = nn.Linear(decoder_hidden, channels)
         self.delta = nn.Sequential(

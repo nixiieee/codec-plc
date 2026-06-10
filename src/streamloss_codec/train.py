@@ -8,8 +8,153 @@ from torch.nn import functional as F
 from streamloss_codec.codec import StreamingSpeechCodec, chunk_samples, frame_audio
 from streamloss_codec.dred import DredProvider
 from streamloss_codec.loss_sim import PacketLossConfig, make_loss_mask
-from streamloss_codec.state_repair import StateRepairMiniEncoder
+from streamloss_codec.state_repair import SegmentRepairAutoencoder, StateRepairMiniEncoder
 
+
+
+
+@dataclass
+class SegmentAELoss:
+    total: torch.Tensor
+    mse: torch.Tensor
+    l1: torch.Tensor
+    stft: torch.Tensor
+    lost_frames: int
+
+
+
+def _multi_scale_stft_loss(reconstructed: torch.Tensor, target: torch.Tensor, fft_sizes: tuple[int, ...] = (64, 128, 256)) -> torch.Tensor:
+    losses = []
+    for n_fft in fft_sizes:
+        if reconstructed.shape[-1] < n_fft:
+            continue
+        window = torch.hann_window(n_fft, device=reconstructed.device, dtype=reconstructed.dtype)
+        pred_spec = torch.stft(
+            reconstructed,
+            n_fft=n_fft,
+            hop_length=max(1, n_fft // 4),
+            win_length=n_fft,
+            window=window,
+            center=True,
+            return_complex=True,
+        ).abs()
+        target_spec = torch.stft(
+            target,
+            n_fft=n_fft,
+            hop_length=max(1, n_fft // 4),
+            win_length=n_fft,
+            window=window,
+            center=True,
+            return_complex=True,
+        ).abs()
+        mag_loss = F.l1_loss(pred_spec, target_spec)
+        log_loss = F.l1_loss(torch.log1p(pred_spec), torch.log1p(target_spec))
+        losses.append(mag_loss + log_loss)
+    if not losses:
+        return F.l1_loss(reconstructed, target)
+    return torch.stack(losses).mean()
+
+
+def _select_lost_segments(
+    audio: torch.Tensor,
+    dred_audio: torch.Tensor,
+    loss_mask: torch.Tensor,
+    sample_rate: int = 16_000,
+    chunk_ms: int = 20,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    frame_size = chunk_samples(sample_rate, chunk_ms)
+    clean_frames = frame_audio(audio, frame_size)
+    dred_frames = frame_audio(dred_audio, frame_size)
+    if loss_mask.shape != clean_frames.shape[:2]:
+        raise ValueError(f"loss_mask must have shape {clean_frames.shape[:2]}, got {loss_mask.shape}")
+    lost = loss_mask.to(clean_frames.device).bool()
+    if not lost.any():
+        empty = clean_frames.reshape(-1, frame_size)[:0]
+        return empty, empty
+    return dred_frames[lost], clean_frames[lost]
+
+
+def train_segment_repair_ae_step(
+    model: SegmentRepairAutoencoder,
+    optimizer: torch.optim.Optimizer,
+    audio: torch.Tensor,
+    dred_audio: torch.Tensor,
+    loss_mask: torch.Tensor,
+    sample_rate: int = 16_000,
+    chunk_ms: int = 20,
+    mse_weight: float = 1.0,
+    l1_weight: float = 0.5,
+    stft_weight: float = 0.5,
+    accelerator: object | None = None,
+) -> SegmentAELoss:
+    inputs, targets = _select_lost_segments(audio, dred_audio, loss_mask, sample_rate=sample_rate, chunk_ms=chunk_ms)
+    if inputs.numel() == 0:
+        zero = _zero_parameter_anchor(model)
+        if zero is None:
+            zero = audio.sum() * 0.0
+        return SegmentAELoss(zero.detach(), zero.detach(), zero.detach(), zero.detach(), 0)
+
+    reconstructed, _ = model(inputs)
+    targets = targets[:, : reconstructed.shape[-1]]
+    mse = F.mse_loss(reconstructed, targets)
+    l1 = F.l1_loss(reconstructed, targets)
+    stft = _multi_scale_stft_loss(reconstructed, targets)
+    total = mse * mse_weight + l1 * l1_weight + stft * stft_weight
+    anchor = _zero_parameter_anchor(model)
+    if anchor is not None:
+        total = total + anchor
+
+    optimizer.zero_grad(set_to_none=True)
+    _backward(total, accelerator)
+    optimizer.step()
+    return SegmentAELoss(total.detach(), mse.detach(), l1.detach(), stft.detach(), int(inputs.shape[0]))
+
+
+@torch.no_grad()
+def evaluate_segment_repair_ae_batch(
+    model: SegmentRepairAutoencoder,
+    audio: torch.Tensor,
+    dred_audio: torch.Tensor,
+    loss_mask: torch.Tensor,
+    sample_rate: int = 16_000,
+    chunk_ms: int = 20,
+) -> SegmentAELoss:
+    was_training = model.training
+    model.eval()
+    inputs, targets = _select_lost_segments(audio, dred_audio, loss_mask, sample_rate=sample_rate, chunk_ms=chunk_ms)
+    if inputs.numel() == 0:
+        zero = audio.sum() * 0.0
+        if was_training:
+            model.train()
+        return SegmentAELoss(zero.detach(), zero.detach(), zero.detach(), zero.detach(), 0)
+    reconstructed, _ = model(inputs)
+    targets = targets[:, : reconstructed.shape[-1]]
+    mse = F.mse_loss(reconstructed, targets)
+    l1 = F.l1_loss(reconstructed, targets)
+    stft = _multi_scale_stft_loss(reconstructed, targets)
+    total = mse + l1 * 0.5 + stft * 0.5
+    if was_training:
+        model.train()
+    return SegmentAELoss(total.detach(), mse.detach(), l1.detach(), stft.detach(), int(inputs.shape[0]))
+
+
+@torch.no_grad()
+def reconstruct_lost_segments_with_ae(
+    model: SegmentRepairAutoencoder,
+    dred_audio: torch.Tensor,
+    loss_mask: torch.Tensor,
+    sample_rate: int = 16_000,
+    chunk_ms: int = 20,
+) -> torch.Tensor:
+    frame_size = chunk_samples(sample_rate, chunk_ms)
+    frames = frame_audio(dred_audio, frame_size).clone()
+    if loss_mask.shape != frames.shape[:2]:
+        raise ValueError(f"loss_mask must have shape {frames.shape[:2]}, got {loss_mask.shape}")
+    lost = loss_mask.to(frames.device).bool()
+    if lost.any():
+        reconstructed, _ = model(frames[lost])
+        frames[lost] = reconstructed[:, :frame_size]
+    return frames.reshape(frames.shape[0], -1)[:, : dred_audio.shape[-1]]
 
 @dataclass
 class LossBreakdown:

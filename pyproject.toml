@@ -10,7 +10,6 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.12.0",
-    "clearml>=2.1.7",
     "loguru>=0.7.3",
     "matplotlib>=3.10.9",
     "numpy>=2.4.6",
@@ -21,6 +20,7 @@ dependencies = [
     "scipy>=1.17.1",
     "sounddevice>=0.5.5",
     "soundfile>=0.13.1",
+    "tensorboard>=2.20.0",
     "torch>=2.12.0",
     "torchaudio>=2.11.0",
 ]

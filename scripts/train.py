@@ -17,12 +17,13 @@ from streamloss_codec.cache.dred_cache import CachedDredDataset, collate_cached_
 from streamloss_codec.codec import StreamingSpeechCodec  # noqa: E402
 from streamloss_codec.config import load_config  # noqa: E402
 from streamloss_codec.data import RawSpeechConfig, RawSpeechDataset  # noqa: E402
-from streamloss_codec.state_repair import StateRepairMiniEncoder  # noqa: E402
+from streamloss_codec.state_repair import SegmentRepairAutoencoder  # noqa: E402
 from streamloss_codec.train import (  # noqa: E402
     evaluate_base_batch,
-    evaluate_cached_repair_batch,
+    evaluate_segment_repair_ae_batch,
+    reconstruct_lost_segments_with_ae,
     train_base_step,
-    train_cached_repair_step,
+    train_segment_repair_ae_step,
 )
 
 
@@ -68,9 +69,8 @@ def _apply_config_defaults(args: argparse.Namespace, cfg: dict[str, Any]) -> arg
     args.max_val_segments = _coalesce(args.max_val_segments, _cfg_value(cfg, "max_val_segments"))
     args.distributed = bool(_coalesce(args.distributed, _cfg_value(cfg, "distributed", False)))
     args.no_progress = not bool(_coalesce(args.progress, _cfg_value(cfg, "progress", True)))
-    args.no_clearml = not bool(_coalesce(args.clearml, _cfg_value(cfg, "clearml_enabled", True)))
-    args.clearml_project = _coalesce(args.clearml_project, _cfg_value(cfg, "clearml_project", "imsit"))
-    args.clearml_task_name = _coalesce(args.clearml_task_name, _cfg_value(cfg, "clearml_task_name"))
+    args.tensorboard = bool(_coalesce(args.tensorboard, _cfg_value(cfg, "tensorboard_enabled", True)))
+    args.tensorboard_dir = _coalesce(args.tensorboard_dir, _cfg_value(cfg, "tensorboard_dir"))
     args.epochs = _coalesce(args.epochs, _stage_value(cfg, stage, "epochs"))
     args.steps = _coalesce(args.steps, _stage_value(cfg, stage, "steps"))
     return args
@@ -117,9 +117,14 @@ def _save_checkpoint(path: Path, payload: dict[str, Any], accelerator: object | 
     torch.save(payload, path)
 
 
-def _state_dict(module: torch.nn.Module, accelerator: object | None = None) -> dict[str, torch.Tensor]:
+def _unwrap_module(module: torch.nn.Module, accelerator: object | None = None) -> torch.nn.Module:
     if accelerator is not None:
-        module = accelerator.unwrap_model(module)
+        return accelerator.unwrap_model(module)
+    return module.module if hasattr(module, "module") else module
+
+
+def _state_dict(module: torch.nn.Module, accelerator: object | None = None) -> dict[str, torch.Tensor]:
+    module = _unwrap_module(module, accelerator)
     state_dict = module.state_dict()
     cleaned = {}
     for key, value in state_dict.items():
@@ -128,13 +133,26 @@ def _state_dict(module: torch.nn.Module, accelerator: object | None = None) -> d
     return cleaned
 
 
-def _load_checkpoint(path: str | None, codec: StreamingSpeechCodec, repair: StateRepairMiniEncoder | None = None) -> int:
+def _load_checkpoint(path: str | None, codec: StreamingSpeechCodec) -> int:
     if path is None:
         return 0
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     codec.load_state_dict(checkpoint["codec_state_dict"], strict=False)
-    if repair is not None and "repair_state_dict" in checkpoint:
-        repair.load_state_dict(checkpoint["repair_state_dict"], strict=False)
+    return int(checkpoint.get("step", 0))
+
+
+def _load_segment_ae_checkpoint(path: str | None, model: SegmentRepairAutoencoder, optimizer: torch.optim.Optimizer | None = None) -> int:
+    if path is None:
+        return 0
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if "segment_ae_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["segment_ae_state_dict"], strict=False)
+    elif "segment_encoder_state_dict" in checkpoint:
+        model.encoder.load_state_dict(checkpoint["segment_encoder_state_dict"], strict=False)
+    else:
+        raise KeyError("checkpoint must contain segment_ae_state_dict or segment_encoder_state_dict")
+    if optimizer is not None and "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     return int(checkpoint.get("step", 0))
 
 
@@ -169,36 +187,34 @@ class TrainLogger:
         self.close()
 
 
-class ClearMLLogger:
-    def __init__(self, args: argparse.Namespace, cfg: dict[str, Any], stage: str, accelerator: object | None) -> None:
-        self.task = None
-        self.logger = None
-        if args.no_clearml or not _is_main(accelerator):
+class TensorBoardLogger:
+    def __init__(self, args: argparse.Namespace, stage: str, accelerator: object | None) -> None:
+        self.writer = None
+        if not args.tensorboard or not _is_main(accelerator):
             return
         try:
-            from clearml import Task
+            from torch.utils.tensorboard import SummaryWriter
         except ImportError:
             return
-        task_name = args.clearml_task_name or f"{stage}:{Path(args.output_dir).name}"
-        self.task = Task.init(project_name=args.clearml_project, task_name=task_name, reuse_last_task_id=False)
-        self.task.connect(cfg, name="config")
-        self.task.connect(vars(args), name="args")
-        self.logger = self.task.get_logger()
+        log_dir = Path(args.tensorboard_dir) if args.tensorboard_dir is not None else Path(args.output_dir) / "tensorboard"
+        self.writer = SummaryWriter(log_dir=str(log_dir / stage))
 
-    def report(self, split: str, metrics: dict[str, float], step: int, epoch: int) -> None:
-        if self.logger is None:
+    def report(self, split: str, metrics: dict[str, float | None], step: int, epoch: int) -> None:
+        if self.writer is None:
             return
         for name, value in metrics.items():
-            self.logger.report_scalar(title=name, series=split, value=float(value), iteration=step)
-        self.logger.report_scalar(title="epoch", series=split, value=float(epoch), iteration=step)
+            if value is None:
+                continue
+            self.writer.add_scalar(f"{split}/{name}", float(value), step)
+        self.writer.add_scalar(f"{split}/epoch", float(epoch), step)
+        self.writer.flush()
 
     def close(self) -> None:
-        if self.task is not None:
-            self.task.close()
-            self.task = None
-            self.logger = None
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
 
-    def __enter__(self) -> "ClearMLLogger":
+    def __enter__(self) -> "TensorBoardLogger":
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
@@ -293,18 +309,13 @@ def _prepare_base(codec, optimizer, train_loader, val_loader, accelerator):
     return accelerator.prepare(codec, optimizer, train_loader, val_loader)
 
 
-def _prepare_repair(codec, repair, optimizer, train_loader, val_loader, accelerator):
+def _prepare_repair(model, optimizer, train_loader, val_loader, accelerator):
     if accelerator is None:
-        return codec, repair, optimizer, train_loader, val_loader
-    codec.encoder.to(accelerator.device)
-    codec.quantizer.to(accelerator.device)
+        return model, optimizer, train_loader, val_loader
     if val_loader is None:
-        decoder, repair, optimizer, train_loader = accelerator.prepare(codec.decoder, repair, optimizer, train_loader)
-        codec.decoder = decoder
-        return codec, repair, optimizer, train_loader, None
-    decoder, repair, optimizer, train_loader, val_loader = accelerator.prepare(codec.decoder, repair, optimizer, train_loader, val_loader)
-    codec.decoder = decoder
-    return codec, repair, optimizer, train_loader, val_loader
+        model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+        return model, optimizer, train_loader, None
+    return accelerator.prepare(model, optimizer, train_loader, val_loader)
 
 
 def _losses_to_vector(losses, batch_size: int, device: torch.device) -> torch.Tensor:
@@ -347,26 +358,91 @@ def validate_base(codec, val_loader, active_quantizers: int, device: torch.devic
     return _reduce_metrics(total, accelerator)
 
 
-def validate_repair(codec, repair, val_loader, active_quantizers: int, device: torch.device, cfg: dict[str, Any], accelerator: object | None, max_batches: int | None) -> dict[str, float] | None:
+def _pesq_score(reference: torch.Tensor, degraded: torch.Tensor, sample_rate: int) -> float | None:
+    try:
+        from pesq import pesq
+    except ImportError:
+        return None
+    if sample_rate != 16_000:
+        return None
+    try:
+        return float(pesq(sample_rate, reference.detach().cpu().numpy(), degraded.detach().cpu().numpy(), "wb"))
+    except Exception:
+        return None
+
+
+def _segment_losses_to_vector(losses, device: torch.device) -> torch.Tensor:
+    return torch.tensor(
+        [
+            float(losses.total) * losses.lost_frames,
+            float(losses.mse) * losses.lost_frames,
+            float(losses.l1) * losses.lost_frames,
+            float(losses.stft) * losses.lost_frames,
+            float(losses.lost_frames),
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+
+
+def _reduce_segment_metrics(total: torch.Tensor, accelerator: object | None) -> dict[str, float]:
+    if accelerator is not None:
+        gathered = accelerator.gather(total.unsqueeze(0))
+        total = gathered.sum(dim=0)
+    count = max(float(total[4].item()), 1.0)
+    return {
+        "total": float((total[0] / count).item()),
+        "mse": float((total[1] / count).item()),
+        "l1": float((total[2] / count).item()),
+        "stft": float((total[3] / count).item()),
+        "lost_frames": float(total[4].item()),
+    }
+
+
+def validate_repair(model, val_loader, device: torch.device, cfg: dict[str, Any], accelerator: object | None, max_batches: int | None) -> dict[str, float | None] | None:
     if val_loader is None:
         return None
     total = torch.zeros(5, dtype=torch.float32, device=device)
+    pesq_values = []
+    dred_pesq_values = []
     for batch_idx, batch in enumerate(val_loader):
         if max_batches is not None and batch_idx >= max_batches:
             break
         audio = batch["audio"].float().to(device, non_blocking=True)
-        losses = evaluate_cached_repair_batch(
-            codec,
-            repair,
+        dred_audio = batch["dred_audio"].float().to(device, non_blocking=True)
+        loss_mask = batch["loss_mask"].bool().to(device, non_blocking=True)
+        losses = evaluate_segment_repair_ae_batch(
+            model,
             audio,
-            batch["dred_audio"].float().to(device, non_blocking=True),
-            batch["loss_mask"].bool().to(device, non_blocking=True),
-            active_quantizers=active_quantizers,
+            dred_audio,
+            loss_mask,
             sample_rate=cfg["sample_rate"],
             chunk_ms=cfg["chunk_ms"],
         )
-        total += _losses_to_vector(losses, audio.shape[0], device)
-    return _reduce_metrics(total, accelerator)
+        total += _segment_losses_to_vector(losses, device)
+        if _is_main(accelerator):
+            patched = reconstruct_lost_segments_with_ae(
+                model,
+                dred_audio,
+                loss_mask,
+                sample_rate=cfg["sample_rate"],
+                chunk_ms=cfg["chunk_ms"],
+            )
+            for ref, pred, dred in zip(audio, patched, dred_audio, strict=False):
+                score = _pesq_score(ref, pred[: ref.numel()], cfg["sample_rate"])
+                if score is not None:
+                    pesq_values.append(score)
+                dred_score = _pesq_score(ref, dred[: ref.numel()], cfg["sample_rate"])
+                if dred_score is not None:
+                    dred_pesq_values.append(dred_score)
+    metrics: dict[str, float | None] = _reduce_segment_metrics(total, accelerator)
+    if _is_main(accelerator):
+        metrics["pesq_wb"] = sum(pesq_values) / len(pesq_values) if pesq_values else None
+        metrics["pesq_wb_dred_baseline"] = sum(dred_pesq_values) / len(dred_pesq_values) if dred_pesq_values else None
+    else:
+        metrics["pesq_wb"] = None
+        metrics["pesq_wb_dred_baseline"] = None
+    return metrics
 
 
 def _should_validate(args: argparse.Namespace, epoch: int, final_epoch: bool) -> bool:
@@ -402,7 +478,7 @@ def run_base(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     target_steps = _target_steps(args, cfg, "base", len(train_loader))
     target_epochs = _target_epochs(args, cfg, "base", target_steps, len(train_loader))
 
-    with TrainLogger(log_path, accelerator) as logger, ClearMLLogger(args, cfg, "base", accelerator) as clearml_logger:
+    with TrainLogger(log_path, accelerator) as logger, TensorBoardLogger(args, "base", accelerator) as tb_logger:
         logger.log({
             "event": "start",
             "stage": "base",
@@ -437,7 +513,7 @@ def run_base(cfg: dict[str, Any], args: argparse.Namespace) -> None:
                         _progress_set_postfix(progress, {"loss": metrics["total"], "recon": metrics["recon"]})
                     if step % args.log_every == 0:
                         logger.log({"event": "metrics", "split": "train", "stage": "base", "epoch": epoch, "step": step, "active_quantizers": active_quantizers, **metrics})
-                        clearml_logger.report("train", metrics, step, epoch)
+                        tb_logger.report("train", metrics, step, epoch)
                     if step % args.save_every == 0 or step >= target_steps:
                         checkpoint_path = out_dir / f"base_step_{step}.pt"
                         _save_checkpoint(checkpoint_path, {"step": step, "epoch": epoch, "codec_state_dict": _state_dict(codec, accelerator), "config": cfg}, accelerator)
@@ -452,7 +528,7 @@ def run_base(cfg: dict[str, Any], args: argparse.Namespace) -> None:
                 val_metrics = validate_base(codec, val_loader, active[-1], device, accelerator, args.val_max_batches)
                 if val_metrics is not None:
                     logger.log({"event": "validation", "split": "val", "stage": "base", "epoch": epoch, "step": step, **val_metrics})
-                    clearml_logger.report("val", val_metrics, step, epoch)
+                    tb_logger.report("val", val_metrics, step, epoch)
         logger.log({"event": "finish", "stage": "base", "step": step, "epoch": epoch})
     if accelerator is not None:
         accelerator.wait_for_everyone()
@@ -479,28 +555,29 @@ def run_repair(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     if val_dataset is not None and len(val_dataset) > 0:
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=args.num_workers, pin_memory=device.type == "cuda", collate_fn=collate_cached_dred)
 
-    codec = StreamingSpeechCodec(**_model_kwargs(cfg))
-    repair = StateRepairMiniEncoder(decoder_hidden=cfg["model"]["decoder_hidden"])
-    start_step = _load_checkpoint(args.resume, codec, repair)
+    repair_cfg = cfg.get("segment_repair", {})
+    model = SegmentRepairAutoencoder(
+        channels=int(repair_cfg.get("channels", cfg["model"].get("channels", 136))),
+        latent_dim=int(repair_cfg.get("latent_dim", 96)),
+        latent_frames=int(repair_cfg.get("latent_frames", 8)),
+        residual=bool(repair_cfg.get("residual", True)),
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg["training"]["repair_lr"])
+    start_step = _load_segment_ae_checkpoint(args.resume, model, optimizer)
     if accelerator is None:
-        codec.to(device)
-        repair.to(device)
-    _set_requires_grad(codec.encoder, False)
-    _set_requires_grad(codec.quantizer, False)
-    _set_requires_grad(codec.decoder, True)
-    optimizer = torch.optim.Adam(list(codec.decoder.parameters()) + list(repair.parameters()), lr=cfg["training"]["repair_lr"])
-    active = cfg["model"].get("active_quantizers_train", [codec.quantizer.num_quantizers])
-    codec, repair, optimizer, train_loader, val_loader = _prepare_repair(codec, repair, optimizer, train_loader, val_loader, accelerator)
+        model.to(device)
+    model, optimizer, train_loader, val_loader = _prepare_repair(model, optimizer, train_loader, val_loader, accelerator)
 
     out_dir = Path(args.output_dir)
     log_path = _log_file_path(args, "repair")
     target_steps = _target_steps(args, cfg, "repair", len(train_loader))
     target_epochs = _target_epochs(args, cfg, "repair", target_steps, len(train_loader))
 
-    with TrainLogger(log_path, accelerator) as logger, ClearMLLogger(args, cfg, "repair", accelerator) as clearml_logger:
+    with TrainLogger(log_path, accelerator) as logger, TensorBoardLogger(args, "repair", accelerator) as tb_logger:
         logger.log({
             "event": "start",
             "stage": "repair",
+            "mode": "segment_ae_pretrain",
             "device": str(device),
             "distributed": accelerator is not None,
             "num_processes": getattr(accelerator, "num_processes", 1),
@@ -508,6 +585,8 @@ def run_repair(cfg: dict[str, Any], args: argparse.Namespace) -> None:
             "val_segments": 0 if val_dataset is None else len(val_dataset),
             "loader_batches_per_process": len(train_loader),
             "batch_size_per_process": batch_size,
+            "embedding_dim": _unwrap_module(model, accelerator).embedding_dim,
+            "segment_repair": repair_cfg,
             "start_step": start_step,
             "target_steps": target_steps,
             "target_epochs": target_epochs,
@@ -523,32 +602,48 @@ def run_repair(cfg: dict[str, Any], args: argparse.Namespace) -> None:
             progress = _make_epoch_progress(stage="repair", epoch=epoch, step=step, target_steps=target_steps, loader_len=len(train_loader), accelerator=accelerator, enabled=not args.no_progress)
             try:
                 for batch in train_loader:
-                    codec.train()
-                    repair.train()
-                    active_quantizers = active[step % len(active)]
-                    losses = train_cached_repair_step(
-                        codec,
-                        repair,
+                    model.train()
+                    losses = train_segment_repair_ae_step(
+                        model,
                         optimizer,
                         batch["audio"].float().to(device, non_blocking=True),
                         batch["dred_audio"].float().to(device, non_blocking=True),
                         batch["loss_mask"].bool().to(device, non_blocking=True),
-                        active_quantizers=active_quantizers,
                         sample_rate=cfg["sample_rate"],
                         chunk_ms=cfg["chunk_ms"],
+                        mse_weight=float(repair_cfg.get("mse_weight", 1.0)),
+                        l1_weight=float(repair_cfg.get("l1_weight", 0.5)),
+                        stft_weight=float(repair_cfg.get("stft_weight", 0.5)),
                         accelerator=accelerator,
                     )
                     step += 1
-                    metrics = {"total": float(losses.total), "recon": float(losses.reconstruction), "repair": float(losses.repair)}
+                    metrics = {
+                        "total": float(losses.total),
+                        "mse": float(losses.mse),
+                        "l1": float(losses.l1),
+                        "stft": float(losses.stft),
+                        "lost_frames": float(losses.lost_frames),
+                    }
                     if progress is not None:
                         progress.update(1)
-                        _progress_set_postfix(progress, {"loss": metrics["total"], "repair": metrics["repair"]})
+                        _progress_set_postfix(progress, {"loss": metrics["total"], "mse": metrics["mse"], "lost": metrics["lost_frames"]})
                     if step % args.log_every == 0:
-                        logger.log({"event": "metrics", "split": "train", "stage": "repair", "epoch": epoch, "step": step, "active_quantizers": active_quantizers, **metrics})
-                        clearml_logger.report("train", metrics, step, epoch)
+                        logger.log({"event": "metrics", "split": "train", "stage": "repair", "epoch": epoch, "step": step, **metrics})
+                        tb_logger.report("train", metrics, step, epoch)
                     if step % args.save_every == 0 or step >= target_steps:
                         checkpoint_path = out_dir / f"repair_step_{step}.pt"
-                        _save_checkpoint(checkpoint_path, {"step": step, "epoch": epoch, "codec_state_dict": _state_dict(codec, accelerator), "repair_state_dict": _state_dict(repair, accelerator), "config": cfg}, accelerator)
+                        _save_checkpoint(
+                            checkpoint_path,
+                            {
+                                "step": step,
+                                "epoch": epoch,
+                                "segment_ae_state_dict": _state_dict(model, accelerator),
+                                "segment_encoder_state_dict": _state_dict(_unwrap_module(model, accelerator).encoder),
+                                "optimizer_state_dict": optimizer.state_dict(),
+                                "config": cfg,
+                            },
+                            accelerator,
+                        )
                         logger.log({"event": "checkpoint", "stage": "repair", "epoch": epoch, "step": step, "path": str(checkpoint_path)})
                     if step >= target_steps:
                         break
@@ -557,10 +652,10 @@ def run_repair(cfg: dict[str, Any], args: argparse.Namespace) -> None:
                     progress.close()
 
             if _should_validate(args, epoch, step >= target_steps):
-                val_metrics = validate_repair(codec, repair, val_loader, active[-1], device, cfg, accelerator, args.val_max_batches)
+                val_metrics = validate_repair(model, val_loader, device, cfg, accelerator, args.val_max_batches)
                 if val_metrics is not None:
                     logger.log({"event": "validation", "split": "val", "stage": "repair", "epoch": epoch, "step": step, **val_metrics})
-                    clearml_logger.report("val", val_metrics, step, epoch)
+                    tb_logger.report("val", val_metrics, step, epoch)
         logger.log({"event": "finish", "stage": "repair", "step": step, "epoch": epoch})
     if accelerator is not None:
         accelerator.wait_for_everyone()
@@ -589,9 +684,11 @@ def main() -> None:
     parser.add_argument("--max-segments", type=int, default=None, help="Override dataset.max_segments for base stage")
     parser.add_argument("--max-val-segments", type=int, default=None, help="Limit base validation segments")
     parser.add_argument("--distributed", action=argparse.BooleanOptionalAction, default=None, help="Force Accelerate mode; accelerate launch sets this automatically via WORLD_SIZE")
-    parser.add_argument("--clearml", dest="clearml", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable ClearML logging")
-    parser.add_argument("--clearml-project", default=None, help="ClearML project name")
-    parser.add_argument("--clearml-task-name", default=None, help="ClearML task name; defaults to <stage>:<output-dir name>")
+    parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable TensorBoard logging")
+    parser.add_argument("--tensorboard-dir", default=None, help="TensorBoard log root; defaults to <output-dir>/tensorboard")
+    parser.add_argument("--clearml", dest="clearml", action=argparse.BooleanOptionalAction, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--clearml-project", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--clearml-task-name", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
     cfg = load_config(args.config)
     args = _apply_config_defaults(args, cfg)

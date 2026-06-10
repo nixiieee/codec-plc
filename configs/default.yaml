@@ -31,6 +31,15 @@ model:
   codebook_size: 256
   active_quantizers_train: [2, 4, 8]
 
+segment_repair:
+  channels: 136
+  latent_dim: 96
+  latent_frames: 8
+  residual: true
+  mse_weight: 1.0
+  l1_weight: 0.5
+  stft_weight: 0.5
+
 packet_loss:
   random_loss_p: 0.05
   burst_loss_p: 0.02
@@ -63,9 +72,8 @@ training:
   max_val_segments: null
   val_every_epochs: 5
   val_max_batches: null
-  clearml_enabled: true
-  clearml_project: dred_minienc
-  clearml_task_name: null
+  tensorboard_enabled: true
+  tensorboard_dir: null
 
   base_lr: 0.0002
   repair_lr: 0.0002
