@@ -36,6 +36,7 @@ def main() -> None:
         split=args.split or dataset_cfg.get("split", "train"),
         val_fraction=dataset_cfg.get("val_fraction", 0.02),
         split_seed=dataset_cfg.get("split_seed", 1234),
+        split_mode=dataset_cfg.get("split_mode", "random"),
         max_segments=args.max_segments if args.max_segments is not None else dataset_cfg.get("max_segments"),
         bitrate=cache_cfg.get("bitrate", 64000),
         dred_frames_10ms=cache_cfg.get("dred_frames_10ms", 100),

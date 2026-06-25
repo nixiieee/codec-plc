@@ -7,25 +7,35 @@ from streamloss_codec.codec.layers import CausalConv1d, CausalResidualBlock
 
 
 class SegmentRepairEncoder(nn.Module):
-    """Encode one 20 ms DRED-restored segment into a 768-value packet embedding."""
+    """Encode one 20 ms DRED-restored segment into a packet embedding."""
 
-    def __init__(self, channels: int = 136, latent_dim: int = 96, latent_frames: int = 8) -> None:
+    def __init__(
+        self,
+        channels: int = 136,
+        latent_dim: int = 96,
+        latent_frames: int = 8,
+        encoder_rates: list[int] | None = None,
+    ) -> None:
         super().__init__()
-        self.latent_dim = latent_dim
-        self.latent_frames = latent_frames
-        self.net = nn.Sequential(
+        self.latent_dim = int(latent_dim)
+        self.latent_frames = int(latent_frames)
+        self.encoder_rates = [2, 2, 2, 5] if encoder_rates is None else [int(rate) for rate in encoder_rates]
+        if any(rate <= 0 for rate in self.encoder_rates):
+            raise ValueError(f"encoder_rates must be positive, got {self.encoder_rates}")
+
+        layers: list[nn.Module] = [
             CausalConv1d(1, channels, 7),
             nn.SiLU(),
             CausalResidualBlock(channels, dilation=1),
-            CausalConv1d(channels, channels, 5, stride=2),
-            nn.SiLU(),
-            CausalResidualBlock(channels, dilation=1),
-            CausalConv1d(channels, channels, 5, stride=2),
-            nn.SiLU(),
-            CausalConv1d(channels, channels, 5, stride=2),
-            nn.SiLU(),
-            CausalConv1d(channels, latent_dim, 5, stride=5),
-        )
+        ]
+        in_channels = channels
+        for index, rate in enumerate(self.encoder_rates):
+            out_channels = self.latent_dim if index == len(self.encoder_rates) - 1 else channels
+            layers.extend([CausalConv1d(in_channels, out_channels, max(3, rate), stride=rate), nn.SiLU()])
+            in_channels = out_channels
+            if index < len(self.encoder_rates) - 1:
+                layers.append(CausalResidualBlock(in_channels, dilation=1))
+        self.net = nn.Sequential(*layers)
 
     @property
     def embedding_dim(self) -> int:
@@ -46,30 +56,38 @@ class SegmentRepairEncoder(nn.Module):
 
 
 class SegmentRepairAutoencoder(nn.Module):
-    """Pretraining autoencoder for the segment repair encoder.
+    """Pretraining autoencoder for the segment repair encoder."""
 
-    The decoder predicts a correction by default. Adding that correction to the
-    DRED input makes the initial model behave like passthrough DRED, instead of
-    forcing the network to synthesize a whole packet from scratch.
-    """
-
-    def __init__(self, channels: int = 136, latent_dim: int = 96, latent_frames: int = 8, residual: bool = True) -> None:
+    def __init__(
+        self,
+        channels: int = 136,
+        latent_dim: int = 96,
+        latent_frames: int = 8,
+        residual: bool = True,
+        encoder_rates: list[int] | None = None,
+    ) -> None:
         super().__init__()
-        self.residual = residual
-        self.encoder = SegmentRepairEncoder(channels=channels, latent_dim=latent_dim, latent_frames=latent_frames)
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose1d(latent_dim, channels, 5, stride=5),
-            nn.SiLU(),
-            CausalResidualBlock(channels, dilation=1),
-            nn.ConvTranspose1d(channels, channels, 4, stride=2, padding=1),
-            nn.SiLU(),
-            CausalResidualBlock(channels, dilation=1),
-            nn.ConvTranspose1d(channels, channels, 4, stride=2, padding=1),
-            nn.SiLU(),
-            nn.ConvTranspose1d(channels, channels, 4, stride=2, padding=1),
-            nn.SiLU(),
-            CausalConv1d(channels, 1, 7),
+        self.residual = bool(residual)
+        rates = [2, 2, 2, 5] if encoder_rates is None else [int(rate) for rate in encoder_rates]
+        self.encoder = SegmentRepairEncoder(
+            channels=channels,
+            latent_dim=latent_dim,
+            latent_frames=latent_frames,
+            encoder_rates=rates,
         )
+        decoder_layers: list[nn.Module] = []
+        in_channels = int(latent_dim)
+        for rate in reversed(rates):
+            decoder_layers.extend(
+                [
+                    nn.ConvTranspose1d(in_channels, channels, kernel_size=rate, stride=rate),
+                    nn.SiLU(),
+                    CausalResidualBlock(channels, dilation=1),
+                ]
+            )
+            in_channels = channels
+        decoder_layers.append(CausalConv1d(channels, 1, 7))
+        self.decoder = nn.Sequential(*decoder_layers)
         self._init_residual_output()
 
     def _init_residual_output(self) -> None:
@@ -89,7 +107,7 @@ class SegmentRepairAutoencoder(nn.Module):
         elif embedding.dim() == 3:
             latent = embedding
         else:
-            raise ValueError(f"embedding must have shape [batch, 768] or [batch, channels, frames], got {embedding.shape}")
+            raise ValueError(f"embedding must have shape [batch, embedding] or [batch, channels, frames], got {embedding.shape}")
         return self.decoder(latent).squeeze(1)
 
     def forward(self, segment: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

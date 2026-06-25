@@ -6,6 +6,7 @@ import torch
 from torch.nn import functional as F
 
 from streamloss_codec.codec import StreamingSpeechCodec, chunk_samples, frame_audio
+from streamloss_codec.dac import OfficialDacPacketCodec
 from streamloss_codec.dred import DredProvider
 from streamloss_codec.loss_sim import PacketLossConfig, make_loss_mask
 from streamloss_codec.state_repair import SegmentRepairAutoencoder, StateRepairMiniEncoder
@@ -20,6 +21,21 @@ class SegmentAELoss:
     l1: torch.Tensor
     stft: torch.Tensor
     lost_frames: int
+
+
+@dataclass
+class DacLoss:
+    total: torch.Tensor
+    mae: torch.Tensor
+    quantizer: torch.Tensor
+    lost_frames: int
+    commitment: torch.Tensor | None = None
+    codebook: torch.Tensor | None = None
+    mel: torch.Tensor | None = None
+    stft: torch.Tensor | None = None
+    adv_gen: torch.Tensor | None = None
+    feat: torch.Tensor | None = None
+    disc: torch.Tensor | None = None
 
 
 
@@ -206,6 +222,159 @@ def train_base_step(
     optimizer.step()
     zero = total.detach() * 0.0
     return LossBreakdown(total.detach(), recon_loss.detach(), quantizer_loss.detach(), zero)
+
+
+def _set_module_requires_grad(module: torch.nn.Module | None, enabled: bool) -> None:
+    if module is None:
+        return
+    for parameter in module.parameters():
+        parameter.requires_grad_(enabled)
+
+
+def train_dac_packet_step(
+    model: OfficialDacPacketCodec,
+    optimizer: torch.optim.Optimizer,
+    audio: torch.Tensor,
+    dred_audio: torch.Tensor,
+    loss_mask: torch.Tensor,
+    *,
+    n_quantizers: int | None = None,
+    quantizer_weight: float = 1.0,
+    accelerator: object | None = None,
+    discriminator: torch.nn.Module | None = None,
+    discriminator_optimizer: torch.optim.Optimizer | None = None,
+    gan_loss: torch.nn.Module | None = None,
+    mel_loss_fn: torch.nn.Module | None = None,
+    stft_loss_fn: torch.nn.Module | None = None,
+    mae_weight: float = 1.0,
+    mel_weight: float = 100.0,
+    stft_weight: float = 0.0,
+    adv_weight: float = 1.0,
+    feat_weight: float = 2.0,
+    commitment_weight: float | None = None,
+    codebook_weight: float | None = None,
+) -> DacLoss:
+    output = model(audio, dred_audio, loss_mask, n_quantizers=n_quantizers)
+    target = audio[:, : output.audio.shape[-1]]
+
+    disc_loss_detached = None
+    if discriminator is not None and discriminator_optimizer is not None:
+        _set_module_requires_grad(discriminator, True)
+        fake = output.audio.detach().unsqueeze(1)
+        real = target.unsqueeze(1)
+        if gan_loss is None:
+            from streamloss_codec.dac import GANLoss
+
+            gan_loss = GANLoss(discriminator)
+        disc_loss = gan_loss.discriminator_loss(fake, real)
+        discriminator_optimizer.zero_grad(set_to_none=True)
+        _backward(disc_loss, accelerator)
+        discriminator_optimizer.step()
+        disc_loss_detached = disc_loss.detach()
+
+    _set_module_requires_grad(discriminator, False)
+    mae = F.l1_loss(output.audio, target)
+    commitment = output.commitment_loss
+    codebook = output.codebook_loss
+    quantizer = commitment + codebook
+    mel = mel_loss_fn(output.audio, target) if mel_loss_fn is not None else None
+    stft = stft_loss_fn(output.audio, target) if stft_loss_fn is not None else None
+
+    adv_gen = None
+    feat = None
+    if commitment_weight is None and codebook_weight is None:
+        total = mae * mae_weight + quantizer * quantizer_weight
+    else:
+        total = mae * mae_weight
+        total = total + commitment * (quantizer_weight if commitment_weight is None else commitment_weight)
+        total = total + codebook * (quantizer_weight if codebook_weight is None else codebook_weight)
+    if mel is not None:
+        total = total + mel * mel_weight
+    if stft is not None:
+        total = total + stft * stft_weight
+    if discriminator is not None:
+        if gan_loss is None:
+            from streamloss_codec.dac import GANLoss
+
+            gan_loss = GANLoss(discriminator)
+        adv_gen, feat = gan_loss.generator_loss(output.audio.unsqueeze(1), target.unsqueeze(1))
+        total = total + adv_gen * adv_weight + feat * feat_weight
+
+    anchor = _zero_parameter_anchor(_wrapped_module(model).dac)
+    if anchor is not None:
+        total = total + anchor
+
+    optimizer.zero_grad(set_to_none=True)
+    _backward(total, accelerator)
+    optimizer.step()
+    _set_module_requires_grad(discriminator, True)
+    return DacLoss(
+        total.detach(),
+        mae.detach(),
+        quantizer.detach(),
+        output.lost_frames,
+        commitment.detach(),
+        codebook.detach(),
+        None if mel is None else mel.detach(),
+        None if stft is None else stft.detach(),
+        None if adv_gen is None else adv_gen.detach(),
+        None if feat is None else feat.detach(),
+        disc_loss_detached,
+    )
+
+
+@torch.no_grad()
+def evaluate_dac_packet_batch(
+    model: OfficialDacPacketCodec,
+    audio: torch.Tensor,
+    dred_audio: torch.Tensor,
+    loss_mask: torch.Tensor,
+    *,
+    n_quantizers: int | None = None,
+    quantizer_weight: float = 1.0,
+    mel_loss_fn: torch.nn.Module | None = None,
+    stft_loss_fn: torch.nn.Module | None = None,
+    mae_weight: float = 1.0,
+    mel_weight: float = 100.0,
+    stft_weight: float = 0.0,
+    commitment_weight: float | None = None,
+    codebook_weight: float | None = None,
+) -> tuple[DacLoss, torch.Tensor]:
+    was_training = model.training
+    model.eval()
+    output = model(audio, dred_audio, loss_mask, n_quantizers=n_quantizers)
+    target = audio[:, : output.audio.shape[-1]]
+    mae = F.l1_loss(output.audio, target)
+    commitment = output.commitment_loss
+    codebook = output.codebook_loss
+    quantizer = commitment + codebook
+    mel = mel_loss_fn(output.audio, target) if mel_loss_fn is not None else None
+    stft = stft_loss_fn(output.audio, target) if stft_loss_fn is not None else None
+    if commitment_weight is None and codebook_weight is None:
+        total = mae * mae_weight + quantizer * quantizer_weight
+    else:
+        total = mae * mae_weight
+        total = total + commitment * (quantizer_weight if commitment_weight is None else commitment_weight)
+        total = total + codebook * (quantizer_weight if codebook_weight is None else codebook_weight)
+    if mel is not None:
+        total = total + mel * mel_weight
+    if stft is not None:
+        total = total + stft * stft_weight
+    if was_training:
+        model.train()
+    return (
+        DacLoss(
+            total.detach(),
+            mae.detach(),
+            quantizer.detach(),
+            output.lost_frames,
+            commitment.detach(),
+            codebook.detach(),
+            None if mel is None else mel.detach(),
+            None if stft is None else stft.detach(),
+        ),
+        output.audio.detach(),
+    )
 
 
 def train_repair_sequence_step(

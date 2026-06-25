@@ -8,6 +8,11 @@ dataset:
   split: train
   val_fraction: 0.02
   split_seed: 1234
+  split_mode: tail
+  wav_dir: data/wav
+  prepare_segment_seconds: 10.0
+  prepare_train_fraction: 0.8
+  val_hours: 1.0
   max_segments: null
 
 dred_cache:
@@ -33,12 +38,50 @@ model:
 
 segment_repair:
   channels: 136
-  latent_dim: 96
-  latent_frames: 8
+  latent_dim: 1024
+  latent_frames: 1
+  encoder_rates: [2, 4, 5, 8]
   residual: true
   mse_weight: 1.0
   l1_weight: 0.5
   stft_weight: 0.5
+
+dac:
+  # Path to a repair checkpoint containing segment_ae_state_dict or segment_encoder_state_dict.
+  frozen_ae_checkpoint: runs/repair_dac_native/repair_step_563800.pt
+  init_from_16khz: true
+  pretrained_dac_checkpoint: null
+  latent_dim: 1024
+  latent_frames: 1
+  encoder_dim: 64
+  encoder_rates: [2, 4, 5, 8]
+  decoder_dim: 1536
+  n_codebooks: 12
+  codebook_size: 1024
+  codebook_dim: 8
+  quantizer_dropout: 0.5
+  n_quantizers: null
+  active_quantizers_train: [12]
+  quantizer_weight: 1.0
+  commitment_weight: 0.25
+  codebook_weight: 1.0
+  mae_weight: 0.0
+  mel_weight: 100.0
+  stft_weight: 0.0
+  adv_weight: 1.0
+  feat_weight: 2.0
+  adam_betas: [0.8, 0.99]
+  scheduler_gamma: 0.999996
+  discriminator:
+    periods: [2, 3, 5, 7, 11]
+    fft_sizes: [2048, 1024, 512]
+  validation_media_samples: 4
+  validation_media_every_epochs: 1
+  valid_freq: 1000
+  sample_freq: 10000
+  save_iters: [10000, 50000, 100000, 200000]
+  val_examples: 200
+  val_batch_size: 10
 
 packet_loss:
   random_loss_p: 0.05
@@ -59,15 +102,18 @@ training:
   distributed: false
   progress: true
   output_dir: null
-  base_output_dir: runs/base_full_2gpu
+  base_output_dir: runs/base_full_2gpu_finetune
   repair_output_dir: runs/repair_full_2gpu
+  dac_output_dir: runs/dac_full_2gpu_finetune
   resume: null
   base_resume: null
   repair_resume: null
+  dac_resume: null
   log_file: null
   log_every: 10
   save_every: 5638
   num_workers: 2
+  dac_num_workers: 8
   max_segments: null
   max_val_segments: null
   val_every_epochs: 5
@@ -77,10 +123,14 @@ training:
 
   base_lr: 0.0002
   repair_lr: 0.0002
-  batch_size: 32
+  dac_lr: 0.0001
+  batch_size: 8
+  dac_batch_size: 8
   segment_seconds: 2.0
   base_epochs: 100
   repair_epochs: 100
+  dac_epochs: null
   base_steps: null
   repair_steps: null
+  dac_steps: 100000
   joint_steps: 50000

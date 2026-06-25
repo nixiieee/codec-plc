@@ -10,10 +10,10 @@ wheels/
 .venv
 
 # Local datasets, generated caches, and external source checkouts
-data/
-cache/
-runs/
-third_party/
+/data/
+/cache/
+/runs/
+/third_party/
 AGENTS.md
 tests/
 .pytest_cache
