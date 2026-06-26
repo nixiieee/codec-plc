@@ -13,13 +13,13 @@ from torch.utils.data import DataLoader
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from streamloss_codec.cache.dred_cache import CachedDredDataset, collate_cached_dred  # noqa: E402
-from streamloss_codec.codec import StreamingSpeechCodec  # noqa: E402
-from streamloss_codec.dac import Discriminator, GANLoss, MelSpectrogramLoss, MultiScaleSTFTLoss, OfficialDacPacketCodec  # noqa: E402
-from streamloss_codec.config import load_config  # noqa: E402
-from streamloss_codec.data import RawSpeechConfig, RawSpeechDataset  # noqa: E402
-from streamloss_codec.state_repair import SegmentRepairAutoencoder  # noqa: E402
-from streamloss_codec.train import (  # noqa: E402
+from cache.dred_cache import CachedDredDataset, collate_cached_dred  # noqa: E402
+from codec import StreamingSpeechCodec  # noqa: E402
+from dac import Discriminator, GANLoss, MelSpectrogramLoss, MultiScaleSTFTLoss, OfficialDacPacketCodec  # noqa: E402
+from config import load_config  # noqa: E402
+from data import RawSpeechConfig, RawSpeechDataset  # noqa: E402
+from state_repair import SegmentRepairAutoencoder  # noqa: E402
+from train import (  # noqa: E402
     evaluate_base_batch,
     evaluate_dac_packet_batch,
     evaluate_segment_repair_ae_batch,
@@ -1146,9 +1146,6 @@ def main() -> None:
     parser.add_argument("--distributed", action=argparse.BooleanOptionalAction, default=None, help="Force Accelerate mode; accelerate launch sets this automatically via WORLD_SIZE")
     parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable TensorBoard logging")
     parser.add_argument("--tensorboard-dir", default=None, help="TensorBoard log root; defaults to <output-dir>/tensorboard")
-    parser.add_argument("--clearml", dest="clearml", action=argparse.BooleanOptionalAction, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--clearml-project", default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--clearml-task-name", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
     cfg = load_config(args.config)
     args = _apply_config_defaults(args, cfg)

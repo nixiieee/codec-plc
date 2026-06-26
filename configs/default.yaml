@@ -25,6 +25,7 @@ dred_cache:
   bitrate: 64000
   dred_frames_10ms: 100
   dry_run: false
+  show_progress: true
   num_workers: 3
 
 model:
@@ -96,7 +97,7 @@ dred:
   context_seconds_max: 2.0
 
 training:
-  # Runtime defaults. CLI flags in scripts/train.py override these values.
+  # Runtime settings. Edit this section, or use another YAML file, for each run.
   stage: base
   device: auto
   distributed: false
@@ -134,3 +135,17 @@ training:
   repair_steps: null
   dac_steps: 100000
   joint_steps: 50000
+
+validation:
+  checkpoint: null
+  manifest: cache/dred/manifest_val.jsonl
+  active_quantizers: null
+  max_segments: null
+  output_dir: runs/validation/latest
+  device: auto
+  nisqa_command: null
+  nisqa_root: NISQA-s
+  nisqa_yaml: null
+  nisqa_device: cpu
+  progress: true
+  save_audio: true

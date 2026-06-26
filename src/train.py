@@ -5,11 +5,11 @@ from dataclasses import dataclass
 import torch
 from torch.nn import functional as F
 
-from streamloss_codec.codec import StreamingSpeechCodec, chunk_samples, frame_audio
-from streamloss_codec.dac import OfficialDacPacketCodec
-from streamloss_codec.dred import DredProvider
-from streamloss_codec.loss_sim import PacketLossConfig, make_loss_mask
-from streamloss_codec.state_repair import SegmentRepairAutoencoder, StateRepairMiniEncoder
+from codec import StreamingSpeechCodec, chunk_samples, frame_audio
+from dac import OfficialDacPacketCodec
+from dred import DredProvider
+from loss_sim import PacketLossConfig, make_loss_mask
+from state_repair import SegmentRepairAutoencoder, StateRepairMiniEncoder
 
 
 
@@ -263,7 +263,7 @@ def train_dac_packet_step(
         fake = output.audio.detach().unsqueeze(1)
         real = target.unsqueeze(1)
         if gan_loss is None:
-            from streamloss_codec.dac import GANLoss
+            from dac import GANLoss
 
             gan_loss = GANLoss(discriminator)
         disc_loss = gan_loss.discriminator_loss(fake, real)
@@ -294,7 +294,7 @@ def train_dac_packet_step(
         total = total + stft * stft_weight
     if discriminator is not None:
         if gan_loss is None:
-            from streamloss_codec.dac import GANLoss
+            from dac import GANLoss
 
             gan_loss = GANLoss(discriminator)
         adv_gen, feat = gan_loss.generator_loss(output.audio.unsqueeze(1), target.unsqueeze(1))

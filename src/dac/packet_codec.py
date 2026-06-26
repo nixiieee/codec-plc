@@ -11,8 +11,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from streamloss_codec.codec import chunk_samples, frame_audio
-from streamloss_codec.state_repair import SegmentRepairEncoder
+from codec import chunk_samples, frame_audio
+from state_repair import SegmentRepairEncoder
 
 from .model import DAC
 

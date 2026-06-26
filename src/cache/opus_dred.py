@@ -10,8 +10,8 @@ from typing import Any, Iterable
 import soundfile as sf
 import torch
 
-from streamloss_codec.data import RawSpeechConfig, RawSpeechDataset
-from streamloss_codec.loss_sim import PacketLossConfig, make_loss_mask
+from data import RawSpeechConfig, RawSpeechDataset
+from loss_sim import PacketLossConfig, make_loss_mask
 
 
 @dataclass(frozen=True)

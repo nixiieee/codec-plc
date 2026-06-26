@@ -7,8 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from streamloss_codec.cache import OpusDredCacheConfig, build_opus_dred_cache  # noqa: E402
-from streamloss_codec.config import load_config  # noqa: E402
+from cache import OpusDredCacheConfig, build_opus_dred_cache  # noqa: E402
+from config import load_config  # noqa: E402
 
 
 def main() -> None:
@@ -45,7 +45,7 @@ def main() -> None:
         min_burst=loss_cfg.get("min_burst", 1),
         max_burst=loss_cfg.get("max_burst", 5),
         dry_run=args.dry_run or cache_cfg.get("dry_run", False),
-        show_progress=not args.no_progress,
+        show_progress=cache_cfg.get("show_progress", True) and not args.no_progress,
         num_workers=args.workers if args.workers is not None else cache_cfg.get("num_workers", 1),
     )
     manifest = build_opus_dred_cache(config)

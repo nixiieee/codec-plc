@@ -3,8 +3,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from streamloss_codec.codec import DecoderState
-from streamloss_codec.codec.layers import CausalConv1d
+from codec import DecoderState
+from codec.layers import CausalConv1d
 
 
 class StateRepairMiniEncoder(nn.Module):

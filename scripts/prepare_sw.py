@@ -7,8 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from streamloss_codec.config import load_config  # noqa: E402
-from streamloss_codec.data.prepare_sw import prepare_sw_with_ffmpeg  # noqa: E402
+from config import load_config  # noqa: E402
+from data.prepare_sw import prepare_sw_with_ffmpeg  # noqa: E402
 
 
 def main() -> None:

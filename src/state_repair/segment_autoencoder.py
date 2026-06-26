@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from streamloss_codec.codec.layers import CausalConv1d, CausalResidualBlock
+from codec.layers import CausalConv1d, CausalResidualBlock
 
 
 class SegmentRepairEncoder(nn.Module):

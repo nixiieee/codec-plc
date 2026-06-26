@@ -15,7 +15,6 @@ dependencies = [
     "numpy>=2.4.6",
     "pandas>=3.0.3",
     "pesq>=0.0.4",
-    "pytest>=9.0.3",
     "pyyaml>=6.0.3",
     "scipy>=1.17.1",
     "sounddevice>=0.5.5",

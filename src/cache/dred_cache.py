@@ -8,7 +8,7 @@ from typing import Any
 import torch
 from torch.utils.data import Dataset
 
-from streamloss_codec.dred import DredProvider
+from dred import DredProvider
 
 
 def load_cache_manifest(path: str | Path) -> list[dict[str, Any]]:

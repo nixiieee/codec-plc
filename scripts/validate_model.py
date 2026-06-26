@@ -23,14 +23,18 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from streamloss_codec.cache.dred_cache import CachedDredDataset  # noqa: E402
-from streamloss_codec.codec import StreamingSpeechCodec, chunk_samples, frame_audio  # noqa: E402
-from streamloss_codec.config import load_config  # noqa: E402
-from streamloss_codec.state_repair import StateRepairMiniEncoder  # noqa: E402
+from cache.dred_cache import CachedDredDataset  # noqa: E402
+from codec import StreamingSpeechCodec, chunk_samples, frame_audio  # noqa: E402
+from config import load_config  # noqa: E402
+from state_repair import StateRepairMiniEncoder  # noqa: E402
 
 
 def _model_kwargs(cfg: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in cfg["model"].items() if key != "active_quantizers_train"}
+
+
+def _cfg_value(cfg: dict[str, Any], key: str, default: Any = None) -> Any:
+    return cfg.get("validation", {}).get(key, default)
 
 
 def _resolve_device(name: str) -> torch.device:
@@ -375,26 +379,41 @@ def _progress(iterable, total: int, enabled: bool):
 def main() -> None:
     parser = argparse.ArgumentParser(description="Validate IMSIT streaming codec against cached Opus DRED outputs.")
     parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--manifest", default=None)
     parser.add_argument("--active-quantizers", type=int, default=None)
     parser.add_argument("--max-segments", type=int, default=None)
-    parser.add_argument("--output-dir", default="runs/validation/latest")
-    parser.add_argument("--device", default="auto")
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--device", default=None)
     parser.add_argument("--nisqa-command", default=None, help="External command template for 48 kHz wavs; use {wav} as the file placeholder.")
-    parser.add_argument("--nisqa-root", default="NISQA-s", help="Local NISQA-S checkout used when --nisqa-command is not set.")
+    parser.add_argument("--nisqa-root", default=None, help="Local NISQA-S checkout used when --nisqa-command is not set.")
     parser.add_argument("--nisqa-yaml", default=None, help="Override local NISQA-S yaml config.")
-    parser.add_argument("--nisqa-device", default="cpu", help="NISQA-S inference device for local scorer.")
-    parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--save-audio", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--nisqa-device", default=None, help="NISQA-S inference device for local scorer.")
+    parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--save-audio", action=argparse.BooleanOptionalAction, default=None)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     sample_rate = int(cfg["sample_rate"])
     chunk_ms = int(cfg["chunk_ms"])
     model_cfg = cfg["model"]
-    active_quantizers = args.active_quantizers or model_cfg.get("active_quantizers_train", [model_cfg["scalar_quantizers"] + model_cfg["vector_quantizers"]])[-1]
-    manifest = args.manifest or cfg["dred_cache"]["val_manifest_path"]
+    default_active_quantizers = model_cfg.get("active_quantizers_train", [model_cfg["scalar_quantizers"] + model_cfg["vector_quantizers"]])[-1]
+    args.checkpoint = args.checkpoint or _cfg_value(cfg, "checkpoint")
+    if args.checkpoint is None:
+        raise ValueError("validation.checkpoint must be set in the config or passed with --checkpoint")
+    args.manifest = args.manifest or _cfg_value(cfg, "manifest", cfg["dred_cache"]["val_manifest_path"])
+    args.active_quantizers = args.active_quantizers or _cfg_value(cfg, "active_quantizers", default_active_quantizers)
+    args.max_segments = args.max_segments if args.max_segments is not None else _cfg_value(cfg, "max_segments")
+    args.output_dir = args.output_dir or _cfg_value(cfg, "output_dir", "runs/validation/latest")
+    args.device = args.device or _cfg_value(cfg, "device", "auto")
+    args.nisqa_command = args.nisqa_command or _cfg_value(cfg, "nisqa_command")
+    args.nisqa_root = args.nisqa_root or _cfg_value(cfg, "nisqa_root", "NISQA-s")
+    args.nisqa_yaml = args.nisqa_yaml or _cfg_value(cfg, "nisqa_yaml")
+    args.nisqa_device = args.nisqa_device or _cfg_value(cfg, "nisqa_device", "cpu")
+    args.progress = bool(_cfg_value(cfg, "progress", True) if args.progress is None else args.progress)
+    args.save_audio = bool(_cfg_value(cfg, "save_audio", True) if args.save_audio is None else args.save_audio)
+    active_quantizers = args.active_quantizers
+    manifest = args.manifest
     output_dir = Path(args.output_dir)
     audio_dir = output_dir / "audio"
     wav48_dir = output_dir / "nisqa_48k"
@@ -488,7 +507,7 @@ def main() -> None:
         "sample_rate": sample_rate,
         "chunk_ms": chunk_ms,
         "nisqa_command": args.nisqa_command,
-        "nisqa_root": None if nisqa_scorer is None else str(Path(args.nisqa_root)),
+        "nisqa_root": None if nisqa_scorer is None or args.nisqa_root is None else str(Path(args.nisqa_root)),
         "nisqa_yaml": args.nisqa_yaml,
     }
     payload = {"metadata": metadata, "parameters": params, "summary": summary, "rows": rows}

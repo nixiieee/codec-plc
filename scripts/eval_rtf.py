@@ -9,9 +9,9 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from streamloss_codec.codec import StreamingSpeechCodec  # noqa: E402
-from streamloss_codec.config import load_config  # noqa: E402
-from streamloss_codec.eval import measure_rtf  # noqa: E402
+from codec import StreamingSpeechCodec  # noqa: E402
+from config import load_config  # noqa: E402
+from eval import measure_rtf  # noqa: E402
 
 
 def main() -> None:

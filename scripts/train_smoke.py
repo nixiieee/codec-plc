@@ -9,10 +9,10 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from streamloss_codec.codec import StreamingSpeechCodec  # noqa: E402
-from streamloss_codec.config import load_config  # noqa: E402
-from streamloss_codec.state_repair import SegmentRepairAutoencoder  # noqa: E402
-from streamloss_codec.train import train_base_step, train_segment_repair_ae_step  # noqa: E402
+from codec import StreamingSpeechCodec  # noqa: E402
+from config import load_config  # noqa: E402
+from state_repair import SegmentRepairAutoencoder  # noqa: E402
+from train import train_base_step, train_segment_repair_ae_step  # noqa: E402
 
 
 def main() -> None:
